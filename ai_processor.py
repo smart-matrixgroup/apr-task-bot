@@ -1,82 +1,98 @@
 import os
+import re
 import json
 import tempfile
-import httpx
 from datetime import datetime
-import anthropic
+import httpx
 import openai
-
-anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+ 
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-
+ 
+ 
 async def transcribe_voice(file_id: str) -> str:
     """Download voice from Telegram and transcribe with Whisper."""
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
         file_path = r.json()["result"]["file_path"]
         audio = await client.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}")
-
+ 
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
         f.write(audio.content)
         tmp_path = f.name
-
+ 
     with open(tmp_path, "rb") as audio_file:
         transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
-            # supports Tamil+English mix
         )
-
+ 
     os.unlink(tmp_path)
     return transcript.text
-
-
+ 
+ 
 def extract_intent(text: str, default_person: str) -> dict:
-    """Use Claude to extract structured intent from natural language."""
+    """
+    Pure regex intent extraction — no API cost, instant response.
+    Handles English + Tamil-English mix.
+    """
+    t = text.lower().strip()
     today = datetime.now().strftime("%d/%m/%Y")
-
-    prompt = f"""Extract task management intent from this message. Return only valid JSON.
-
-Today: {today}
-Sender: {default_person}
-
-Message: "{text}"
-
-JSON format:
-{{
-  "action": "update_task" | "get_report" | "unknown",
-  "person": "SANJEEV" | "SHIAN",
-  "task_number": "05",        // 2-digit string, only for update_task
-  "status": "DONE" | "PENDING" | "IN PROGRESS" | "HOLD",  // only for update_task
-  "finish_date": "28/08/2026" // DD/MM/YYYY, only when status=DONE, else ""
-}}
-
-Rules:
-- Default person is {default_person} unless another name is mentioned
-- Tamil words: "mudinjuchu"/"done" → DONE, "pending"/"iruku" → PENDING
-- "report"/"summary"/"ena pending" → get_report
-- task number can be spoken as "task five", "5th task", "task 05"
-
-Examples:
-- "task 5 done" → {{"action":"update_task","person":"{default_person}","task_number":"05","status":"DONE","finish_date":"{today}"}}
-- "shian task 3 pending" → {{"action":"update_task","person":"SHIAN","task_number":"03","status":"PENDING","finish_date":""}}
-- "ena pending iruku" → {{"action":"get_report","person":"{default_person}"}}
-- "sanjeev report" → {{"action":"get_report","person":"SANJEEV"}}"""
-
-    msg = anthropic_client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=150,
-        messages=[{"role": "user", "content": prompt}]
+ 
+    # --- Detect person ---
+    person = default_person
+    if re.search(r'\bshian\b', t):
+        person = "SHIAN"
+    elif re.search(r'\bsanjeev\b', t):
+        person = "SANJEEV"
+ 
+    # --- Detect report request ---
+    report_keywords = [
+        "report", "summary", "pending", "what.*pending", "ena.*pending",
+        "pending.*iruku", "pending.*task", "status", "overview",
+        "mudiyala", "baki", "remaining"
+    ]
+    if any(re.search(kw, t) for kw in report_keywords):
+        # Only if no task number mentioned
+        if not re.search(r'\b(\d{1,2})\b', t):
+            return {"action": "get_report", "person": person}
+ 
+    # --- Detect task update ---
+    # Extract task number — supports: "task 5", "task5", "5th task", "#5", "task number 5"
+    task_match = re.search(
+        r'(?:task\s*(?:number\s*)?#?\s*(\d{1,2}))|(?:#(\d{1,2}))|(?:(\d{1,2})\s*(?:st|nd|rd|th)?\s*task)',
+        t
     )
-
-    raw = msg.content[0].text.strip()
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-
-    return json.loads(raw.strip())
+ 
+    if task_match:
+        task_num = next(g for g in task_match.groups() if g is not None)
+        task_num = str(int(task_num)).zfill(2)
+ 
+        # Detect status
+        status = "PENDING"  # default
+        finish_date = ""
+ 
+        done_keywords = ["done", "complete", "finish", "finished", "mudinjuchu",
+                         "mudinja", "completed", "over", "mudinjichu", "ok panni"]
+        hold_keywords = ["hold", "wait", "pause", "later"]
+        progress_keywords = ["progress", "working", "start", "in progress", "ongoing"]
+ 
+        if any(kw in t for kw in done_keywords):
+            status = "DONE"
+            finish_date = today
+        elif any(kw in t for kw in hold_keywords):
+            status = "HOLD"
+        elif any(kw in t for kw in progress_keywords):
+            status = "IN PROGRESS"
+ 
+        return {
+            "action": "update_task",
+            "person": person,
+            "task_number": task_num,
+            "status": status,
+            "finish_date": finish_date
+        }
+ 
+    # --- Fallback ---
+    return {"action": "unknown", "person": person}
+ 

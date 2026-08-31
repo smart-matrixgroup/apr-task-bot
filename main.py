@@ -12,23 +12,22 @@ app = FastAPI()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Map Telegram user IDs → person name
-# Fill these in your .env after getting your Telegram ID (send /start to bot)
-USER_MAP: dict[str, str] = {}
-
 
 def _build_user_map() -> dict:
     mapping = {}
-    sanjeev_id = os.getenv("SANJEEV_TELEGRAM_ID", "")
-    shian_id = os.getenv("SHIAN_TELEGRAM_ID", "")
-    if sanjeev_id:
-        mapping[sanjeev_id] = "SANJEEV"
-    if shian_id:
-        mapping[shian_id] = "SHIAN"
+    sid = os.getenv("SANJEEV_TELEGRAM_ID", "")
+    hid = os.getenv("SHIAN_TELEGRAM_ID", "")
+    if sid:
+        mapping[sid] = "SANJEEV"
+    if hid:
+        mapping[hid] = "SHIAN"
     return mapping
 
 
-async def send_message(chat_id: int, text: str):
+USER_MAP: dict = {}
+
+
+async def send(chat_id: int, text: str):
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json={
             "chat_id": chat_id,
@@ -47,52 +46,54 @@ async def startup():
 async def webhook(request: Request):
     data = await request.json()
     message = data.get("message", {})
-
     if not message:
         return {"ok": True}
 
     chat_id = message["chat"]["id"]
     user_id = str(message.get("from", {}).get("id", ""))
     username = message.get("from", {}).get("first_name", "User")
+    default_person = USER_MAP.get(user_id, "SANJEEV")
 
-    # /start — show Telegram ID
-    if message.get("text", "").startswith("/start"):
-        await send_message(chat_id,
-            f"👋 Hello {username}!\n\n"
-            f"Your Telegram ID: <code>{user_id}</code>\n\n"
-            f"Give this ID to the admin to link your account.\n\n"
-            f"Commands:\n"
-            f"• Voice/text: <i>Task 5 done</i>\n"
+    # /start command
+    if message.get("text", "").strip() == "/start":
+        await send(chat_id,
+            f"👋 Vanakkam {username}!\n\n"
+            f"🆔 Your Telegram ID: <code>{user_id}</code>\n\n"
+            f"<b>How to use:</b>\n"
+            f"🎙 Send a <b>voice message</b> or <b>text</b> like:\n"
+            f"• <i>Task 5 done</i>\n"
+            f"• <i>Task 12 mudinjuchu</i>\n"
             f"• <i>My pending tasks</i>\n"
-            f"• <i>Sanjeev report</i>"
+            f"• <i>Shian report kudu</i>\n"
+            f"• <i>Task 3 in progress</i>"
         )
         return {"ok": True}
 
-    # Determine person from user map, default SANJEEV
-    default_person = USER_MAP.get(user_id, "SANJEEV")
-
-    # Get transcript
+    # Get text content
     try:
         if "voice" in message:
-            await send_message(chat_id, "🎙 Transcribing...")
+            await send(chat_id, "🎙 Ketukiren...")
             text = await transcribe_voice(message["voice"]["file_id"])
-            await send_message(chat_id, f"📝 I heard: <i>{text}</i>")
+            await send(chat_id, f"📝 Kettatu: <i>{text}</i>")
         elif "text" in message:
-            text = message["text"]
+            text = message["text"].strip()
         else:
-            await send_message(chat_id, "Send a voice message or text.")
+            await send(chat_id, "Voice message or text anuppu.")
             return {"ok": True}
 
-        # Extract intent
+        # AI understands intent
         intent = extract_intent(text, default_person)
 
     except Exception as e:
-        await send_message(chat_id, f"❌ Error processing message: {str(e)}")
+        await send(chat_id, f"❌ Error: {str(e)}")
         return {"ok": True}
 
     # Execute intent
     try:
-        if intent["action"] == "update_task":
+        action = intent.get("action", "unknown")
+        ai_reply = intent.get("reply", "")
+
+        if action == "update_task":
             success = update_task(
                 person=intent["person"],
                 task_num=intent["task_number"],
@@ -100,37 +101,38 @@ async def webhook(request: Request):
                 finish_date=intent.get("finish_date", "")
             )
             if success:
-                await send_message(chat_id,
-                    f"✅ Updated!\n"
-                    f"👤 {intent['person']}\n"
-                    f"📌 Task {intent['task_number']}\n"
-                    f"🔖 Status: {intent['status']}"
+                response = (
+                    f"✅ Sheet update aayiduchu!\n"
+                    f"👤 {intent['person']} → Task {intent['task_number']}: <b>{intent['status']}</b>"
                 )
+                if ai_reply:
+                    response += f"\n\n{ai_reply}"
             else:
-                await send_message(chat_id,
-                    f"❌ Task {intent['task_number']} not found for {intent['person']}.\n"
-                    f"Check the task number and try again."
-                )
+                response = f"❌ Task {intent.get('task_number')} kaanom. Task number correct-a irukka?"
 
-        elif intent["action"] == "get_report":
+        elif action == "get_report":
             report = get_report(intent["person"])
-            await send_message(chat_id, report)
+            response = report
 
         else:
-            await send_message(chat_id,
-                "❓ Didn't understand. Try:\n"
+            response = (
+                "❓ Puriyala. Ippadi try pannunga:\n"
                 "• <i>Task 5 done</i>\n"
                 "• <i>Task 12 pending</i>\n"
                 "• <i>My pending tasks</i>\n"
                 "• <i>Shian report</i>"
             )
+            if ai_reply:
+                response = ai_reply + "\n\n" + response
+
+        await send(chat_id, response)
 
     except Exception as e:
-        await send_message(chat_id, f"❌ Sheet update failed: {str(e)}")
+        await send(chat_id, f"❌ Sheet update error: {str(e)}")
 
     return {"ok": True}
 
 
 @app.get("/")
 async def root():
-    return {"status": "APR Task Bot is running ✅"}
+    return {"status": "APR Task Bot running ✅"}

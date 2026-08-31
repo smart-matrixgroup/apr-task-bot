@@ -1,98 +1,77 @@
 import os
 import re
-import json
 import tempfile
 from datetime import datetime
 import httpx
 import openai
- 
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
- 
- 
+
+
 async def transcribe_voice(file_id: str) -> str:
-    """Download voice from Telegram and transcribe with Whisper."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
+    """Download voice from Telegram, transcribe with Whisper."""
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
         file_path = r.json()["result"]["file_path"]
-        audio = await client.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}")
- 
+        audio = await http.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}")
+
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
         f.write(audio.content)
         tmp_path = f.name
- 
-    with open(tmp_path, "rb") as audio_file:
-        transcript = openai_client.audio.transcriptions.create(
+
+    with open(tmp_path, "rb") as af:
+        transcript = client.audio.transcriptions.create(
             model="whisper-1",
-            file=audio_file,
+            file=af,
+            prompt="This is a task management system. User speaks in Tamil and English. Tasks have numbers like task 1, task 5, task 12."
         )
- 
+
     os.unlink(tmp_path)
     return transcript.text
- 
- 
+
+
 def extract_intent(text: str, default_person: str) -> dict:
-    """
-    Pure regex intent extraction — no API cost, instant response.
-    Handles English + Tamil-English mix.
-    """
-    t = text.lower().strip()
+    """Use GPT-4o-mini to understand natural language intent."""
     today = datetime.now().strftime("%d/%m/%Y")
- 
-    # --- Detect person ---
-    person = default_person
-    if re.search(r'\bshian\b', t):
-        person = "SHIAN"
-    elif re.search(r'\bsanjeev\b', t):
-        person = "SANJEEV"
- 
-    # --- Detect report request ---
-    report_keywords = [
-        "report", "summary", "pending", "what.*pending", "ena.*pending",
-        "pending.*iruku", "pending.*task", "status", "overview",
-        "mudiyala", "baki", "remaining"
-    ]
-    if any(re.search(kw, t) for kw in report_keywords):
-        # Only if no task number mentioned
-        if not re.search(r'\b(\d{1,2})\b', t):
-            return {"action": "get_report", "person": person}
- 
-    # --- Detect task update ---
-    # Extract task number — supports: "task 5", "task5", "5th task", "#5", "task number 5"
-    task_match = re.search(
-        r'(?:task\s*(?:number\s*)?#?\s*(\d{1,2}))|(?:#(\d{1,2}))|(?:(\d{1,2})\s*(?:st|nd|rd|th)?\s*task)',
-        t
+
+    system = f"""You are a task management assistant. Extract structured intent from messages.
+Today is {today}. The sender is {default_person}.
+
+RULES:
+- Understand Tamil, English, or mixed Tamil-English messages
+- Tamil words: "mudinjuchu/mudinjichu/done/complete/finish" = DONE status
+- Tamil: "pending/iruku/baki/mudiyala" related to listing = get_report
+- Tamil: "report/summary/ena iruku/paarunga" = get_report
+- Default person is {default_person} unless Sanjeev or Shian is mentioned
+- Task numbers can be spoken as "task five", "5th task", "task number 5", "ஐந்தாவது task"
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "action": "update_task" | "get_report" | "unknown",
+  "person": "SANJEEV" | "SHIAN",
+  "task_number": "05",
+  "status": "DONE" | "PENDING" | "IN PROGRESS" | "HOLD",
+  "finish_date": "31/08/2026",
+  "reply": "friendly one-line confirmation in same language as user"
+}}
+
+For get_report: only include action, person, reply.
+For unknown: only include action, reply with helpful suggestion.
+For update_task: include all fields. finish_date only when status=DONE, else empty string."""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=200,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": text}
+        ]
     )
- 
-    if task_match:
-        task_num = next(g for g in task_match.groups() if g is not None)
-        task_num = str(int(task_num)).zfill(2)
- 
-        # Detect status
-        status = "PENDING"  # default
-        finish_date = ""
- 
-        done_keywords = ["done", "complete", "finish", "finished", "mudinjuchu",
-                         "mudinja", "completed", "over", "mudinjichu", "ok panni"]
-        hold_keywords = ["hold", "wait", "pause", "later"]
-        progress_keywords = ["progress", "working", "start", "in progress", "ongoing"]
- 
-        if any(kw in t for kw in done_keywords):
-            status = "DONE"
-            finish_date = today
-        elif any(kw in t for kw in hold_keywords):
-            status = "HOLD"
-        elif any(kw in t for kw in progress_keywords):
-            status = "IN PROGRESS"
- 
-        return {
-            "action": "update_task",
-            "person": person,
-            "task_number": task_num,
-            "status": status,
-            "finish_date": finish_date
-        }
- 
-    # --- Fallback ---
-    return {"action": "unknown", "person": person}
- 
+
+    import json
+    raw = resp.choices[0].message.content.strip()
+    # Strip markdown fences if present
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
